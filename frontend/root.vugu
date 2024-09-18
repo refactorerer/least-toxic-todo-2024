@@ -1,0 +1,200 @@
+<div>
+    <main role="main" class="container text-center">
+
+        <h1>todos:</h1>
+        <div vg-for='c.Items'>
+            <div>
+                <span vg-content="value"></span>
+            </div>
+        </div>
+
+        <hr>
+
+        <form>
+
+            <vgform:Input type="text" name="title" :Value='vgform.StringPtr{&c.NewTodo}'></vgform:Input>
+
+            <div>You entered: <span vg-html="c.NewTodo"></span></div>
+
+            <button type="button" @click="c.HandleClick(event)">Save</button>
+
+        </form>
+
+    </main>
+</div>
+
+<script type="application/x-go">
+
+import (
+    //"time"
+    "fmt"
+    "net/http"
+    "os"
+    "golang.org/x/net/html"
+    "encoding/json"
+    "strings"
+    //"errors"
+    "bytes"
+    "io"
+    "net/url"
+    "github.com/vugu/vugu/vgform"
+    "io/ioutil"
+    //"syscall/js"
+    "regexp"
+)
+
+
+type Root struct {
+    NewTodo string
+    Loading bool
+    Items []string `vugu:"data"`
+    actionId string
+    url string
+}
+
+func (c *Root) HandleClick(event vugu.DOMEvent) {
+
+    val := c.NewTodo
+    c.NewTodo = ""
+
+    go func() {
+        form := url.Values{}
+        form.Add("1_title", val)
+        form.Add(fmt.Sprintf("1_%v", c.actionId), "")
+        form.Add("0", "[\"$K1\"]")
+
+        client := &http.Client{}
+        req, _ := http.NewRequest("POST", c.url, strings.NewReader(form.Encode()))
+        req.Header.Add("Next-Action", strings.TrimPrefix(c.actionId, "$ACTION_ID_"))
+        req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+
+        resp, err := client.Do(req)
+        if err != nil {
+            fmt.Fprintf(os.Stderr, "%v\n", err)
+            return
+        }
+        
+        respBody, _ := ioutil.ReadAll(resp.Body)
+        fmt.Fprintf(os.Stderr, "%v\n", string(respBody))
+
+        var newPort string
+        myExp := regexp.MustCompile(`\{(\"port\"\:)(?<port>\d*)\}`)
+        match := myExp.FindStringSubmatch(string(respBody))
+        for i, name := range myExp.SubexpNames() {
+            if name == "port" {
+                newPort = match[i]
+            }
+        }
+
+        js.Global().Get("window").Get("location").Set("href", "http://localhost:8844?port=" + newPort)
+        
+        defer resp.Body.Close()
+    }()
+
+}
+
+func ParseTodos(doc *html.Node) ([]string) {
+    var res []string
+    var crawler func(*html.Node)
+    crawler = func(node *html.Node) {
+        if node.Type == html.ElementNode && node.Data == "div" {
+            for _, attr := range node.Attr {
+                if attr.Key == "data-obj" {
+                    var data map[string][]string
+                    b := []byte(attr.Val)
+                    _ = json.Unmarshal(b, &data)
+                    res = data["items"]
+                    return
+                }
+            }
+        }
+        for child := node.FirstChild; child != nil; child = child.NextSibling {
+            crawler(child)
+        }
+    }
+    crawler(doc)
+    return res
+}
+
+func renderNode(n *html.Node) string {
+    var buf bytes.Buffer
+    w := io.Writer(&buf)
+    html.Render(w, n)
+    return buf.String()
+}
+
+func ParseActionId(doc *html.Node) string {
+    var res string
+    var crawler func(*html.Node)
+    crawler = func(node *html.Node) {
+        if node.Type == html.ElementNode && node.Data == "input" {
+            for _, attr := range node.Attr {
+                if attr.Key == "name" && strings.HasPrefix(attr.Val, "$ACTION_ID_") {
+                    res = attr.Val
+                    return
+                }
+            }
+        }
+        for child := node.FirstChild; child != nil; child = child.NextSibling {
+            crawler(child)
+        }
+    }
+    crawler(doc)
+    return res
+}
+
+func (c *Root) Init(ctx vugu.InitCtx) {
+
+    c.Loading = true
+
+    pg := js.Global().Get("pg").Get("PGlite").New()
+    promise := pg.Call("exec", "CREATE TABLE IF NOT EXISTS todo (id SERIAL PRIMARY KEY, name TEXT)");
+    
+    _, _ = await(promise)
+    // fmt.Fprintf(os.Stderr, "%v\n", res[0])
+    // js.Global().Get("console").Call("log", res[0])
+
+    searchStr := js.Global().Get("location").Get("search").String()
+    parts := strings.Split(searchStr, "?port=")
+    if len(parts) > 1 {
+        c.url = "http://localhost:" + parts[1]
+    } else {
+        c.url = "http://localhost:3000"
+    }
+
+    go func() {
+
+        resp, err := http.Get(c.url)
+        if err != nil {
+            log.Printf("Error fetching: %v", err)
+            return
+        }
+        defer resp.Body.Close()
+
+        doc, _ := html.Parse(resp.Body)
+        todos := ParseTodos(doc)
+
+        for _, todo := range todos {
+            promise = pg.Call("exec", "insert into todo (name) values ('" + todo + "')")
+            _, err := await(promise)
+            if err != nil {
+                js.Global().Get("console").Call("error", err[0])
+            }
+        }
+
+        c.actionId = ParseActionId(doc)
+
+        promise = pg.Call("exec", "select * from todo")
+        res, _ := await(promise)
+
+        js.Global().Get("console").Call("log", "imported todos", res[0])
+
+        c.Items = todos
+
+        ctx.EventEnv().Lock()
+        c.Loading = false
+        ctx.EventEnv().UnlockRender()
+    }()
+}
+    
+</script>
